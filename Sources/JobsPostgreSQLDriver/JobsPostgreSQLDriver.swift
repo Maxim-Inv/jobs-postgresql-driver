@@ -8,179 +8,225 @@
 import Foundation
 import Vapor
 import Jobs
-import FluentPostgreSQL
+import FluentPostgresDriver
 import NIO
+import Fluent
+import FluentSQL
 
-
-/// A wrapper that conforms to `JobsPersistenceLayer`
-public struct JobsPostgreSQLDriver {
-  
-  /// The `PostgreSQLDatabase` to run commands on
-  let databaseIdentifier: DatabaseIdentifier<PostgreSQLDatabase>
-  
-  /// The `Container` to run jobs on
-  public let container: Container
-  
-  /// Completed jobs should be deleted
-  public let deleteCompletedJobs: Bool
-  
-  /// Creates a new `JobsPostgreSQLDriver` instance
-  ///
-  /// - Parameters:
-  ///   - databaseIdentifier: The `DatabaseIdentifier<PostgreSQLDatabase>` to run commands on
-  ///   - container: The `Container` to run jobs on
-  public init(databaseIdentifier: DatabaseIdentifier<PostgreSQLDatabase>, container: Container, deleteCompletedJobs: Bool = false) {
-    self.databaseIdentifier = databaseIdentifier
-    self.container = container
-    self.deleteCompletedJobs = deleteCompletedJobs
-  }
+extension Application.Jobs.Provider {
+    
+    public static func postgre(deleteCompletedJobs: Bool = false) -> Self {
+        .init { (application: Application) in
+            application.jobs.use(custom: JobsPostgreSQLDriver.init(databases: application.databases, deleteCompletedJobs: deleteCompletedJobs, on: application.eventLoopGroup))
+        }
+    }
 }
 
-extension JobsPostgreSQLDriver: JobsPersistenceLayer {
-  public var eventLoop: EventLoop {
-    return container.next()
-  }
-  
-  public func get(key: String) -> EventLoopFuture<JobStorage?> {
-    // Establish a database connection
-    return container.withPooledConnection(to: databaseIdentifier) { conn in
-      
-      // We ned to use SKIP LOCKED in order to handle multiple threads all getting the next job
-      // Not sure how to make use of SKIP LOCKED in the QueryBuilder, saw raw SQL it is ...
-      let sql = PostgreSQLQuery(stringLiteral: """
+public struct JobsPostgreSQLDriver {
+    let logger = Logger(label: "codes.vapor.postgres")
+    /// Completed jobs should be deleted
+    public let deleteCompletedJobs: Bool
+    public let databases: Databases
+    
+    public init(databases: Databases, deleteCompletedJobs: Bool, on eventLoopGroup: EventLoopGroup) {
+        self.deleteCompletedJobs = deleteCompletedJobs
+        self.databases = databases
+    }
+}
+
+extension JobsPostgreSQLDriver: JobsDriver {
+    
+    public func makeQueue(with context: JobContext) -> JobsQueue {
+        _JobsPosgtresQueue(
+            database: self.databases.database(.psql, logger: logger, on: context.eventLoop)!,
+            deleteCompletedJobs: deleteCompletedJobs,
+            context: context
+        )
+    }
+    
+    public func shutdown() {
+        //self.pool.shutdown()
+    }
+}
+
+struct _JobsPosgtresQueue {
+    let database: Database
+    let deleteCompletedJobs: Bool
+    let context: JobContext
+}
+
+enum _JobsPosgtresError: Error {
+    case missingJob
+    case invalidIdentifier
+}
+
+extension JobIdentifier {
+    var key: String {
+        "job:\(self.string)"
+    }
+}
+
+extension _JobsPosgtresQueue: JobsQueue {
+    
+    func get(_ id: JobIdentifier) -> EventLoopFuture<JobData> {
+        let sqlQuery: SQLQueryString = """
+        SELECT * FROM job
+        WHERE key = '\(id.key)'
+        """
+        
+        print("🚀 \(type(of: self)) : \(#function) for key = \(id.key)")
+        
+        guard let postgresDatabase = self.database as? PostgresDatabase else {
+            let error = Abort(.internalServerError, reason: "could not set db")
+            return self.eventLoop.makeFailedFuture(error)
+        }
+        
+        return postgresDatabase.withConnection { (postgresConnection) -> EventLoopFuture<JobData> in
+            postgresConnection.sql().raw(sqlQuery).first(decoding: JobModel.self).flatMapThrowing { (jobModel) -> JobData in
+                guard let data = jobModel?.data else { throw _JobsPosgtresError.missingJob }
+                let decoder = try JSONDecoder().decode(DecoderUnwrapper.self, from: data)
+                return try JobData(from: decoder.decoder)
+            }
+        }
+    }
+    
+    func set(_ id: JobIdentifier, to data: JobData) -> EventLoopFuture<Void> {
+        // Establish a database connection
+        return self.database.withConnection { database -> EventLoopFuture<Void> in
+            // Encode and save the Job
+            let _data = try! JSONEncoder().encode(data)
+            return JobModel(key: id.key, jobId: id.string, data: _data).save(on: database)
+        }
+    }
+    
+    func clear(_ id: JobIdentifier) -> EventLoopFuture<Void> {
+        print("🚀 \(type(of: self)) : \(#function) id.key = \(id.key)")
+        return self.database.withConnection { database -> EventLoopFuture<Void> in
+            // Update the state
+            print("I must delete \(id.key)")
+            return JobModel.query(on: database)
+                .filter(\.$key == id.key)
+                .first()
+                .flatMap { jobModel in
+                    if let jobModel = jobModel {
+                        print("🚀 \(type(of: self)) : \(#function) we have found this job for clearing \(jobModel)")
+                        // If we are just deleting completed jobs, then delete the job
+                        if self.deleteCompletedJobs {
+                            return jobModel.delete(on: database).transform(to: ())
+                        }
+                        // Otherwise, update the state
+                        jobModel.state = JobState.completed.rawValue
+                        jobModel.updatedAt = Date()
+                        return jobModel.save(on: database)
+                    }
+                    return database.eventLoop.future()
+            }
+        }
+    }
+    
+    func pop() -> EventLoopFuture<JobIdentifier?> {
+        print("pop()")
+        let sqlQuery: SQLQueryString = """
         UPDATE job SET state = 'processing',
         updated_at = clock_timestamp()
         WHERE id = (
         SELECT id
         FROM job
-        WHERE key = '\(key)'
-        AND state = 'pending'
+        WHERE
+        state = 'pending'
         ORDER BY id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         )
         RETURNING *
-        """)
-      
-      // Retrieve the next Job
-      return conn.query(sql).map(to: JobStorage?.self) { rows in
-        if let job = rows.first,
-          let data = job.firstValue(name: "data")?.binary {
-          // Now decode the Job for processing
-          let decoder = try JSONDecoder().decode(DecoderUnwrapper.self, from: data)
-          return try JobStorage(from: decoder.decoder)
-        }
-        return nil
-      }
-    }
-  }
-  
-  public func set(key: String, jobStorage: JobStorage) -> EventLoopFuture<Void> {
-    // Establish a database connection
-    return container.withPooledConnection(to: databaseIdentifier) { conn in
-      // Encode and save the Job
-      let data = try JSONEncoder().encode(jobStorage)
-      return JobModel(key: key, jobId: jobStorage.id, data: data).save(on: conn).map { jobModel in
-        return
-      }
-    }
-  }
-  
-  public func completed(key: String, jobStorage: JobStorage) -> EventLoopFuture<Void> {
-    // Establish a database connection
-    return container.withPooledConnection(to: databaseIdentifier) { conn in
-      // Update the state
-      return JobModel.query(on: conn).filter(\.jobId == jobStorage.id).first().flatMap { jobModel in
-        if let jobModel = jobModel {
-          // If we are just deleting completed jobs, then delete the job
-          if self.deleteCompletedJobs {
-            return jobModel.delete(on: conn).transform(to: ())
-          }
-          
-          // Otherwise, update the state
-          jobModel.state = JobState.completed.rawValue
-          jobModel.updatedAt = Date()
-          return jobModel.save(on: conn).map(to: Void.self) { jobModel in
-            return
-          }
+        """
+        
+        guard let postgresDatabase = self.database as? PostgresDatabase else {
+            let error = Abort(.internalServerError, reason: "could not set db")
+            return self.eventLoop.makeFailedFuture(error)
         }
         
-        return conn.future()
-      }
+        return postgresDatabase.withConnection { (postgresConnection) -> EventLoopFuture<JobIdentifier?> in
+            return postgresConnection.sql().raw(sqlQuery).first(decoding: JobModel.self).flatMapThrowing { jobModel in
+                guard let jobModel = jobModel else {
+                    return nil
+                }
+                
+                return .init(string: jobModel.job_id)
+            }
+        }
     }
-  }
-  
-  /// Not used in PostgreSQL implementation!
-  public func processingKey(key: String) -> String {
-    return "\(key)-processing"
-  }
+    
+    func push(_ id: JobIdentifier) -> EventLoopFuture<Void> {
+        return self.eventLoop.future()
+    }
 }
 
 struct DecoderUnwrapper: Decodable {
-  let decoder: Decoder
-  init(from decoder: Decoder) { self.decoder = decoder }
+    let decoder: Decoder
+    init(from decoder: Decoder) { self.decoder = decoder }
 }
 
 enum JobState: String, Codable {
-  case pending = "pending"
-  case processing = "processing"
-  case completed = "completed"
+    case pending = "pending"
+    case processing = "processing"
+    case completed = "completed"
 }
-public final class JobModel: PostgreSQLModel {
-  /// Types
-  public typealias Database = PostgreSQLDatabase
-  public typealias ID = Int
-  public static let idKey: IDKey = \.id
-  
-  /// Properties
-  public static let entity = "job"
-  public var id: Int?
-  
-  /// The Job key
-  var key: String
-  /// The unique Job uuid
-  var jobId: String
-  /// The Job data
-  var data: Data
-  /// The current state of the Job
-  var state: String
-  
-  /// The created timestamp
-  var createdAt: Date
-  /// The updated timestamp
-  var updatedAt: Date
-  
-  /// Codable keys
-  enum CodingKeys: String, CodingKey {
-    case id
-    case key
-    case jobId = "job_id"
-    case data
-    case state
-    case createdAt = "created_at"
-    case updatedAt = "updated_at"
-  }
-  
-  init(key: String,
-       jobId: String,
-       data: Data,
-       state: JobState = .pending,
-       createdAt: Date = Date(),
-       updatedAt: Date = Date()) {
-    self.key = key
-    self.jobId = jobId
-    self.data = data
-    self.state = state.rawValue
-    self.createdAt = createdAt
-    self.updatedAt = updatedAt
-  }
+public final class JobModel: Model, Content {
+    public static let schema = "job"
+    
+    @ID(key: "id")
+    public var id: Int?
+    
+    /// The Job key
+    @Field(key: "key")
+    var key: String
+    
+    /// The unique Job uuid
+    @Field(key: "job_id")
+    var job_id: String
+    
+    /// The Job data
+    @Field(key: "data")
+    var data: Data
+    
+    /// The current state of the Job
+    @Field(key: "state")
+    var state: String
+    
+    /// The created timestamp
+    @Timestamp(key: "created_at", on: .create)
+    var createdAt: Date?
+    
+    /// The updated timestamp
+    @Timestamp(key: "updated_at", on: .update)
+    var updatedAt: Date?
+    
+    /// Codable keys
+    enum CodingKeys: String, CodingKey {
+        case id
+        case key
+        case jobId = "job_id"
+        case data
+        case state
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+    
+    public init() {
+    }
+    
+    init(key: String,
+         jobId: String,
+         data: Data,
+         state: JobState = .pending,
+         createdAt: Date = Date(),
+         updatedAt: Date = Date()) {
+        self.key = key
+        self.job_id = jobId
+        self.data = data
+        self.state = state.rawValue
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 }
-
-/// Allows `JobModel` to be used as a dynamic migration.
-extension JobModel: Migration { }
-
-/// Allows `JobModel` to be encoded to and decoded from HTTP messages.
-extension JobModel: Content { }
-
-/// Allows `JobModel` to be used as a dynamic parameter in route definitions.
-extension JobModel: Parameter { }
