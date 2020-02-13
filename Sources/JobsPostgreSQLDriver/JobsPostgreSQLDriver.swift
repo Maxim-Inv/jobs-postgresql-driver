@@ -125,7 +125,6 @@ extension _JobsPosgtresQueue: JobsQueue {
     }
     
     func pop() -> EventLoopFuture<JobIdentifier?> {
-        print("pop()")
         let sqlQuery: SQLQueryString = """
         UPDATE job SET state = 'processing',
         updated_at = clock_timestamp()
