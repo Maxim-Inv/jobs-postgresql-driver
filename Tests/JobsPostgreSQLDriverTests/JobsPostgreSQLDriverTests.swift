@@ -1,9 +1,7 @@
 import XCTest
 import class Foundation.Bundle
 import JobsPostgreSQLDriver
-import FluentPostgreSQL
-import NIO
-@testable import Jobs
+import FluentPostgresDriver
 
 final class JobsPostgreSQLDriverTests: XCTestCase {
     
@@ -13,7 +11,6 @@ final class JobsPostgreSQLDriverTests: XCTestCase {
     override func tearDown() {
     }
 
-    static var allTests = [
-    ]
+//    static var allTests = []
 }
 

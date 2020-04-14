@@ -13,11 +13,11 @@ import NIO
 import Fluent
 import FluentSQL
 
-extension Application.Jobs.Provider {
+extension Application.Queues.Provider {
     
     public static func postgre(deleteCompletedJobs: Bool = false) -> Self {
         .init { (application: Application) in
-            application.jobs.use(custom: JobsPostgreSQLDriver.init(databases: application.databases, deleteCompletedJobs: deleteCompletedJobs, on: application.eventLoopGroup))
+            application.queues.use(custom: JobsPostgreSQLDriver.init(databases: application.databases, deleteCompletedJobs: deleteCompletedJobs, on: application.eventLoopGroup))
         }
     }
 }
@@ -34,9 +34,9 @@ public struct JobsPostgreSQLDriver {
     }
 }
 
-extension JobsPostgreSQLDriver: JobsDriver {
+extension JobsPostgreSQLDriver: QueuesDriver {
     
-    public func makeQueue(with context: JobContext) -> JobsQueue {
+    public func makeQueue(with context: QueueContext) -> Queue {
         _JobsPosgtresQueue(
             database: self.databases.database(.psql, logger: logger, on: context.eventLoop)!,
             deleteCompletedJobs: deleteCompletedJobs,
@@ -52,7 +52,7 @@ extension JobsPostgreSQLDriver: JobsDriver {
 struct _JobsPosgtresQueue {
     let database: Database
     let deleteCompletedJobs: Bool
-    let context: JobContext
+    let context: QueueContext
 }
 
 enum _JobsPosgtresError: Error {
@@ -66,7 +66,7 @@ extension JobIdentifier {
     }
 }
 
-extension _JobsPosgtresQueue: JobsQueue {
+extension _JobsPosgtresQueue: Queue {
     
     func get(_ id: JobIdentifier) -> EventLoopFuture<JobData> {
         let sqlQuery: SQLQueryString = """
