@@ -25,11 +25,7 @@ public final class JobModel: Model, Content {
     /// The Job key
     @Field(key: "key")
     var key: String
-    
-    /// The unique Job uuid
-    @Field(key: "job_id")
-    var job_id: String
-    
+        
     /// The Job data
     @Field(key: "data")
     var data: Data
@@ -64,13 +60,11 @@ public final class JobModel: Model, Content {
     }
     
     init(key: String,
-         jobId: String,
          data: Data,
          state: JobState = .pending,
          createdAt: Date = Date(),
          updatedAt: Date = Date()) {
         self.key = key
-        self.job_id = jobId
         self.data = data
         self.state = state.rawValue
         self.createdAt = createdAt

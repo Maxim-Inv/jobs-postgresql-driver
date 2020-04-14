@@ -60,21 +60,15 @@ enum _JobsPosgtresError: Error {
     case invalidIdentifier
 }
 
-extension JobIdentifier {
-    var key: String {
-        "job:\(self.string)"
-    }
-}
-
 extension _JobsPosgtresQueue: Queue {
     
     func get(_ id: JobIdentifier) -> EventLoopFuture<JobData> {
         let sqlQuery: SQLQueryString = """
         SELECT * FROM job
-        WHERE key = '\(id.key)'
+        WHERE key = '\(id.string)'
         """
         
-        print("🚀 \(type(of: self)) : \(#function) for key = \(id.key)")
+        print("🚀 \(type(of: self)) : \(#function) for key = \(id.string)")
         
         guard let postgresDatabase = self.database as? PostgresDatabase else {
             let error = Abort(.internalServerError, reason: "could not set db")
@@ -95,17 +89,15 @@ extension _JobsPosgtresQueue: Queue {
         return self.database.withConnection { database -> EventLoopFuture<Void> in
             // Encode and save the Job
             let _data = try! JSONEncoder().encode(data)
-            return JobModel(key: id.key, jobId: id.string, data: _data).save(on: database)
+            return JobModel(key: id.string, data: _data).save(on: database)
         }
     }
     
     func clear(_ id: JobIdentifier) -> EventLoopFuture<Void> {
-        print("🚀 \(type(of: self)) : \(#function) id.key = \(id.key)")
+        print("🚀 \(type(of: self)) : \(#function) id.key = \(id.string)")
         return self.database.withConnection { database -> EventLoopFuture<Void> in
-            // Update the state
-            print("I must delete \(id.key)")
             return JobModel.query(on: database)
-                .filter(\.$key == id.key)
+                .filter(\.$key == id.string)
                 .first()
                 .flatMap { jobModel in
                     if let jobModel = jobModel {
@@ -151,7 +143,7 @@ extension _JobsPosgtresQueue: Queue {
                     return nil
                 }
                 
-                return .init(string: jobModel.job_id)
+                return .init(string: jobModel.key)
             }
         }
     }

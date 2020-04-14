@@ -8,7 +8,6 @@ public struct CreateJob: Migration {
         return database.schema(JobModel.schema)
             .field("id", .int, .identifier(auto: true))
             .field("key", .string, .required)
-            .field("job_id", .string, .required)
             .field("data", .data, .required)
             .field("state", .string, .required)
             .field("created_at", .datetime)
