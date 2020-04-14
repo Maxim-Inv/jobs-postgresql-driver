@@ -7,7 +7,7 @@
 
 import Foundation
 import Vapor
-import Jobs
+import Queues
 import FluentPostgresDriver
 import NIO
 import Fluent
